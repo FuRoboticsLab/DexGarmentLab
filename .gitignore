@@ -1,0 +1,13 @@
+Assets/Garment
+Assets/LeapMotion
+Assets/Robots
+Assets/Scene
+Assets/Human
+Data/*
+!Data/*.py
+Tool_Scripts
+Texture_Generate.sh
+pipeline.sh
+/*.py
+tmp*
+**/__pycache__/
