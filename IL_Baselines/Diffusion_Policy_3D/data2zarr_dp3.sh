@@ -10,8 +10,8 @@
 task_name=${1}
 stage_index=${2}
 train_data_num=${3}
-isaac_path=~/isaacsim_4.5.0/python.sh
-
+#isaac_path=~/isaacsim_4.5.0/python.sh
+isaac_path=/home/simo/Documents/isaac-sim-standalone-4.5.0-linux-x86_64/python.sh
 export ISAAC_PATH=$isaac_path
 
 $ISAAC_PATH data2zarr_dp3.py ${task_name} ${stage_index} ${train_data_num}

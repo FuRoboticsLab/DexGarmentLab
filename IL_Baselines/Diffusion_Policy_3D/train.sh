@@ -16,7 +16,8 @@ DEBUG=${5} # True or False
 
 save_ckpt=True
 
-isaac_path=~/isaacsim_4.5.0/python.sh
+#isaac_path=~/isaacsim_4.5.0/python.sh
+isaac_path=/home/simo/Documents/isaac-sim-standalone-4.5.0-linux-x86_64/python.sh
 
 export ISAAC_PATH=$isaac_path
 

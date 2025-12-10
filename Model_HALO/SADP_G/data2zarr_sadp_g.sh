@@ -10,7 +10,8 @@
 task_name=${1}
 stage_index=${2}
 train_data_num=${3}
-python_path=~/isaacsim_4.5.0/python.sh
+#python_path=~/isaacsim_4.5.0/python.sh
+python_path=/home/simo/Documents/isaac-sim-standalone-4.5.0-linux-x86_64/python.sh
 
 export ISAAC_PATH=$python_path
 

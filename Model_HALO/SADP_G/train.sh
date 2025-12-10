@@ -13,7 +13,8 @@ expert_data_num=${2}
 seed=${3}
 gpu_id=${4}
 DEBUG=${5} # True or False
-python_path=~/isaacsim_4.5.0/python.sh
+#python_path=~/isaacsim_4.5.0/python.sh
+python_path=/home/simo/Documents/isaac-sim-standalone-4.5.0-linux-x86_64/python.sh
 
 export ISAAC_PATH=$python_path
 

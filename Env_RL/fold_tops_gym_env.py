@@ -152,21 +152,23 @@ class FoldTopsGymEnv(gym.Env):
             visual_material_usd=self.config.get("ground_material_usd"),
         )
         
-        # Add garment
-        #default_usd = "Assets/Garment/Tops/Collar_Lsleeve_FrontClose/TCLC_018/TCLC_018_obj.usd"
-        #usd_path = self.config.get("usd_path", os.getcwd() + "/" + default_usd)
-        
+        # Add garment - MUST use Tops garment for Fold_Tops task!
+        garment_usd = self.config.get(
+            "garment_usd_path",
+            os.getcwd() + "/Assets/Garment/Tops/Collar_Lsleeve_FrontClose/TCLC_018/TCLC_018_obj.usd"
+        )
         self._garment = Particle_Garment(
             self._base_env.world,
             pos=np.array([0, 3.0, 0.6]),
             ori=np.array([0.0, 0.0, 0.0]),
-            #usd_path=usd_path,
+            usd_path=garment_usd,
             contact_offset=0.012,
             rest_offset=0.010,
             particle_contact_offset=0.012,
             fluid_rest_offset=0.010,
             solid_rest_offset=0.010,
         )
+        print(f"[FoldTopsGymEnv] Using garment: {garment_usd}")
         
         # Add bimanual robot
         self._robot = Bimanual_Ur10e(
@@ -543,4 +545,6 @@ def register_fold_tops_env():
         entry_point="Env_RL.fold_tops_gym_env:FoldTopsGymEnv",
         max_episode_steps=300,
     )
+
+
 

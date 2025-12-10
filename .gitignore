@@ -11,3 +11,23 @@ pipeline.sh
 /*.py
 tmp*
 **/__pycache__/
+
+# ========== RL Training Outputs ==========
+# RL model checkpoints (root level)
+/checkpoints/
+
+# Training logs
+/logs/
+*.tfevents.*
+*.monitor.csv
+
+# Tensorboard
+tensorboard/
+runs/
+
+# Stable-Baselines3 outputs (in Env_RL)
+Env_RL/*.zip
+Env_RL/*.npz
+
+# Wandb (if used)
+wandb/

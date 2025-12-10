@@ -5,7 +5,8 @@ task_name=$1
 demo_num=$2
 
 # export isaac path. [!!] please change to your own path! 
-isaac_path=~/isaacsim_4.5.0/python.sh # changeable
+#isaac_path=~/isaacsim_4.5.0/python.sh # changeable
+isaac_path=/home/simo/Documents/isaac-sim-standalone-4.5.0-linux-x86_64/python.sh
 export ISAAC_PATH=$isaac_path
 
 # create target dir and file

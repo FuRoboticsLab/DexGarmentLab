@@ -7,8 +7,17 @@ import open3d as o3d
 def furthest_point_sampling(points, colors=None, n_samples=2048):
     """
     points: [N, 3] tensor containing the whole point cloud
-    n_samples: samples you want in the sampled point cloud typically &lt;&lt; N 
+    n_samples: samples you want in the sampled point cloud typically << N 
     """
+    # Handle empty point cloud - return zeros of expected shape
+    if len(points) == 0:
+        empty_points = np.zeros((n_samples, 3), dtype=np.float32)
+        if colors is None:
+            return empty_points
+        else:
+            empty_colors = np.zeros((n_samples, 3), dtype=np.float32)
+            return empty_points, empty_colors
+    
     # Convert points to PyTorch tensor if not already and move to GPU
     points = torch.Tensor(points).cuda()  # [N, 3]
     if colors is not None:
