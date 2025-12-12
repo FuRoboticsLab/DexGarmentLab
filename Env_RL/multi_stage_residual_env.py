@@ -4,7 +4,7 @@ Multi-Stage Residual RL Environment for Garment Folding with SADP_G Guidance.
 This environment implements multi-stage residual RL where:
 - 3 SADP_G models (frozen) provide stage-specific IL guidance
 - Single RL policy learns residuals AND when to transition stages
-- Stage transitions are learned, not hard-coded
+- Stage transitions use HYBRID approach: proactive triggers + RL control
 
 Architecture:
     action = [joint_residuals(60D), stage_advance_signal(1D)]
@@ -16,28 +16,49 @@ Architecture:
 Key Features:
 - Single RL policy handles all 3 stages
 - Stage indicator in observation enables stage-aware behavior
-- RL learns WHEN to advance stages (not just how to fold)
+- HYBRID stage transitions: proactive triggers + RL learning
 - Bounded residuals ensure IL provides strong guidance
 - Stage-specific rewards encourage proper sequencing
 - Joint-space actions match SADP_G output format
 
-=== Quick Wins: Surgical Residual Application ===
-Since IL is already performing well, RL makes SURGICAL interventions:
+=== HYBRID Stage Advance (NEW!) ===
+Stage advances can happen in TWO ways:
 
-1. ARM-ONLY RESIDUALS (arm_only_residuals=True):
-   - Only arm joints (6 per side = 12 total) receive residuals
-   - Hand joints (24 per side) are 100% IL-controlled
-   - This preserves IL's grasp configuration
+1. PROACTIVE (automatic): Based on IL's natural behavior
+   - When IL has run ~200 steps (its training duration)
+   - When quality plateaus (no improvement for N steps)
+   - RL doesn't need to learn these - they happen automatically
+   
+2. RL-CONTROLLED: RL can trigger early advance
+   - If RL outputs advance_signal > 0.5
+   - Rewards RL for learning optimal timing
+   - Can discover better transitions than fixed IL duration
 
-2. SPARSE APPLICATION (residual_apply_interval=5):
-   - Residuals only applied every N steps
-   - Reduces noise and lets IL trajectory shine through
-   - RL focuses on key positioning moments
+This hybrid approach lets RL focus on learning while benefiting from
+IL's implicit knowledge about stage completion.
 
-3. SKIP DURING MANIPULATION (disable_residual_during_manipulation=True):
-   - When gripper is closed (grasping), use pure IL
-   - Residuals only affect approach/positioning phases
-   - Protects delicate manipulation
+=== PHASE-AWARE RL Control (High-Level Decisions) ===
+RL focuses on HIGH-LEVEL strategic decisions, IL handles detailed manipulation:
+
+1. MANIPULATION PHASES:
+   - APPROACH: RL CAN adjust arm position (where to grab)
+   - GRASP: Pure IL (no RL intervention)
+   - MANIPULATE: Pure IL (IL's expertise, RL stays out)
+   - RELEASE: RL CAN adjust arm position (where to release)
+
+2. ARM-ONLY RESIDUALS:
+   - RL only adjusts arm positioning (6 joints per arm)
+   - Hand/finger control is 100% IL (24 joints per hand)
+   - This protects IL's grasp quality
+
+3. PHASE DETECTION:
+   - Gripper OPEN + approaching garment = APPROACH phase (RL active)
+   - Gripper CLOSING or CLOSED = MANIPULATION phase (Pure IL)
+   - Gripper OPENING = RELEASE phase (RL can adjust)
+
+4. SAFE STAGE TRANSITIONS:
+   - Hands automatically opened before stage advance
+   - Prevents dragging cloth to new manipulation points
 
 Usage:
     env = MultiStageResidualEnv(
@@ -115,15 +136,25 @@ class MultiStageResidualEnv(gym.Env):
         config: Optional[Dict] = None,
         render_mode: str = "human",
         max_episode_steps: int = 400,  # Total across all stages
-        # Residual configuration - now with separate arm/hand scales
-        arm_residual_scale: float = 0.05,   # For 6 arm joints per side
-        hand_residual_scale: float = 0.01,  # For 24 hand joints per side (more sensitive!)
+        # Logging configuration
+        verbose: bool = True,          # Print training progress
+        print_every_n_steps: int = 50, # Print status every N steps
+        # Residual configuration - SMALLER to avoid disrupting IL
+        arm_residual_scale: float = 0.05,   # Small residuals - let IL do most of the work
+        hand_residual_scale: float = 0.0,   # Hand joints: ZERO - IL controls hands 100%
         action_scale: float = 0.05,
-        # ========== Quick Wins: Surgical Residual Application ==========
-        arm_only_residuals: bool = True,          # Only apply residuals to arm (not hand)
-        residual_apply_interval: int = 5,         # Apply residual every N steps
-        disable_residual_during_manipulation: bool = True,  # Skip residuals when grasping
-        gripper_threshold: float = 0.5,           # Threshold for gripper closed detection
+        # ========== PHASE-AWARE RL Configuration ==========
+        # RL focuses on HIGH-LEVEL control (positioning), IL handles manipulation
+        arm_only_residuals: bool = True,          # ONLY arm residuals, hands are pure IL
+        residual_apply_interval: int = 5,         # Apply every 5 steps (sparse) - less interference
+        disable_residual_during_manipulation: bool = True,   # NO residuals when gripper closed!
+        gripper_threshold: float = 0.3,           # Lower threshold to detect early grasp
+        # ========== Phase Detection Configuration ==========
+        enable_phase_aware_control: bool = False,  # DISABLED initially - let IL work freely
+        approach_phase_steps: int = 50,           # First N steps of stage = approach
+        # ========== Early Termination Configuration ==========
+        enable_early_termination: bool = False,   # DISABLED initially - too aggressive
+        early_termination_penalty: float = 0.0,   # No penalty if disabled
         # ========== Initial State Configuration ==========
         # Match SADP_G training distribution to avoid data shift!
         use_fixed_initial_state: bool = True,     # Use fixed position (matches validation)
@@ -133,9 +164,16 @@ class MultiStageResidualEnv(gym.Env):
         random_pos_y_range: Tuple[float, float] = (0.7, 0.9),   # Random Y range if not fixed
         # Observation configuration
         point_cloud_size: int = 2048,
-        # Stage transition configuration
-        stage_advance_threshold: float = 0.5,
-        min_steps_before_advance: int = 10,  # Min steps in stage before can advance
+        # ========== HYBRID Stage Transition Configuration ==========
+        stage_advance_threshold: float = 0.5,         # RL signal threshold
+        min_steps_before_advance: int = 10,           # Min steps before RL can advance
+        # Proactive advance settings (based on IL behavior) - MORE LENIENT
+        enable_proactive_advance: bool = True,        # Enable auto-advance triggers
+        il_steps_per_stage: int = 200,                # IL's natural duration per stage
+        proactive_advance_after_ratio: float = 0.85,  # Auto-advance after 85% of IL steps (was 0.9)
+        min_quality_for_proactive: float = 0.1,       # Min quality for proactive advance (was 0.2, more lenient)
+        quality_plateau_window: int = 30,             # Steps to detect plateau
+        quality_plateau_threshold: float = 0.02,      # Max improvement to be "plateau"
         # Device
         device: str = "cuda:0",
     ):
@@ -164,8 +202,14 @@ class MultiStageResidualEnv(gym.Env):
             random_pos_x_range: (min, max) X range if using random position
             random_pos_y_range: (min, max) Y range if using random position
             point_cloud_size: Number of points in observation
-            stage_advance_threshold: Threshold for stage advance signal
-            min_steps_before_advance: Minimum steps before stage can advance
+            stage_advance_threshold: Threshold for RL's stage advance signal
+            min_steps_before_advance: Minimum steps before RL can trigger advance
+            enable_proactive_advance: Enable automatic stage advances based on IL behavior
+            il_steps_per_stage: IL's natural duration per stage (SADP_G uses ~200)
+            proactive_advance_after_ratio: Auto-advance after this ratio of IL steps
+            min_quality_for_proactive: Minimum fold quality for proactive advance
+            quality_plateau_window: Window size to detect quality plateau
+            quality_plateau_threshold: Max improvement to be considered "plateau"
             device: Device for IL policy inference
         """
         super().__init__()
@@ -185,6 +229,30 @@ class MultiStageResidualEnv(gym.Env):
         self.min_steps_before_advance = min_steps_before_advance
         self.device = device
         
+        # ========== HYBRID Stage Advance Configuration ==========
+        self.enable_proactive_advance = enable_proactive_advance
+        self.il_steps_per_stage = il_steps_per_stage
+        self.proactive_advance_after_ratio = proactive_advance_after_ratio
+        self.min_quality_for_proactive = min_quality_for_proactive
+        self.quality_plateau_window = quality_plateau_window
+        self.quality_plateau_threshold = quality_plateau_threshold
+        
+        # ========== Phase-Aware RL Control ==========
+        self.enable_phase_aware_control = enable_phase_aware_control
+        self.approach_phase_steps = approach_phase_steps
+        self._current_phase = "approach"  # Track current manipulation phase
+        
+        # ========== Early Termination Configuration ==========
+        self.enable_early_termination = enable_early_termination
+        self.early_termination_penalty = early_termination_penalty
+        
+        # ========== Logging Configuration ==========
+        self.verbose = verbose
+        self.print_every_n_steps = print_every_n_steps
+        self._episode_count = 0
+        self._total_rl_advances = 0
+        self._total_proactive_advances = 0
+        
         # Will be initialized lazily
         self._initialized = False
         self._il_wrapper = None
@@ -200,6 +268,10 @@ class MultiStageResidualEnv(gym.Env):
         # Progress tracking for early termination
         self._recent_fold_progress = []
         self._progress_window = 30  # Track last 30 steps
+        
+        # ========== HYBRID Stage Advance Tracking ==========
+        self._stage_quality_history = []  # Track quality within current stage
+        self._proactive_advance_triggered = False  # Flag for logging
         
         # ========== Quick Wins: Surgical Residual Application ==========
         # 1. Only apply residuals to ARM joints (not hand) - hand is IL-controlled
@@ -297,26 +369,38 @@ class MultiStageResidualEnv(gym.Env):
                 shape=(3,),  # [stage1_done, stage2_done, stage3_done]
                 dtype=np.float32
             ),
+            # NEW: Hint for RL about when to advance (helps faster learning)
+            "should_advance_hint": spaces.Box(
+                low=0, high=1,
+                shape=(1,),  # 1.0 = proactive conditions met, 0.0 = not yet
+                dtype=np.float32
+            ),
+            # NEW: Current manipulation phase (helps RL know when it can act)
+            "manipulation_phase": spaces.Box(
+                low=0, high=1,
+                shape=(3,),  # One-hot: [approach, manipulation, release]
+                dtype=np.float32
+            ),
         })
         
-        # Reward weights
+        # Reward weights (ENHANCED: More positive, less negative to encourage learning)
         self.reward_weights = {
-            # Task rewards
-            "fold_progress": 1.0,
-            "compactness": 0.5,
-            "height_penalty": 0.3,
-            # Residual rewards
-            "residual_penalty": 0.02,
-            "smoothness_penalty": 0.05,  # Penalize jerky movements
-            # Stage transition rewards
-            "stage_advance_bonus": 5.0,
-            "premature_advance_penalty": 2.0,
-            "late_advance_penalty": 0.1,
-            # Completion rewards
-            "stage_completion_bonus": 3.0,
-            "task_success_bonus": 20.0,
-            # Early termination penalty
-            "early_termination_penalty": 5.0,
+            # Task rewards (increased to encourage progress)
+            "fold_progress": 2.0,      # Increased from 1.0
+            "compactness": 1.0,         # Increased from 0.5
+            "height_penalty": 0.2,     # Reduced from 0.3 (less harsh)
+            # Residual rewards (reduced penalties)
+            "residual_penalty": 0.01,   # Reduced from 0.02 (allow more exploration)
+            "smoothness_penalty": 0.02, # Reduced from 0.05 (less harsh)
+            # Stage transition rewards (increased bonuses)
+            "stage_advance_bonus": 10.0,      # Increased from 5.0
+            "premature_advance_penalty": 1.0, # Reduced from 2.0 (less harsh)
+            "late_advance_penalty": 0.05,    # Reduced from 0.1
+            # Completion rewards (increased to encourage success)
+            "stage_completion_bonus": 5.0,   # Increased from 3.0
+            "task_success_bonus": 30.0,      # Increased from 20.0
+            # Early termination penalty (disabled if early termination is off)
+            "early_termination_penalty": 0.0, # Set to 0 (handled by flag)
         }
         
     def _lazy_init(self):
@@ -501,6 +585,23 @@ class MultiStageResidualEnv(gym.Env):
         # Reset tracking variables
         self._last_joint_action = None
         self._recent_fold_progress = []
+        self._stage_quality_history = []
+        self._proactive_advance_triggered = False
+        
+        # Reset episode-level counters
+        self._episode_count += 1
+        self._total_rl_advances = 0
+        self._total_proactive_advances = 0
+        self._current_phase = "approach"  # Start in approach phase
+        
+        if self.verbose:
+            print(f"\n🎬 Starting Episode {self._episode_count}")
+            print(f"   IL Policy: {'Dummy' if self.use_dummy_il else 'SADP_G'}")
+            print(f"   Phase-Aware Control: {'Enabled' if self.enable_phase_aware_control else 'Disabled'}")
+            print(f"   Early Termination: {'Enabled' if self.enable_early_termination else 'Disabled'}")
+            print(f"   Proactive Advance: {'Enabled' if self.enable_proactive_advance else 'Disabled'}")
+            print(f"   Residual Scale: Arm={self.arm_residual_scale:.3f}, Hand={self.hand_residual_scale:.3f}")
+            print(f"   Residual Interval: Every {self.residual_apply_interval} steps")
         
         # ========== CRITICAL: Full World Reset ==========
         # The particle cloth maintains internal state (velocities, rotations) that
@@ -618,15 +719,45 @@ class MultiStageResidualEnv(gym.Env):
         # Update IL observation history (important for temporal diffusion policy)
         self._il_wrapper.update_obs(il_obs)
         
-        # Handle stage advance
+        # Update garment state BEFORE stage advance checks
+        self._update_garment_pcd_and_gam()
+        
+        # Track stage quality for plateau detection
+        stage_quality = self._evaluate_current_stage_quality()
+        self._stage_quality_history.append(stage_quality)
+        
+        # ========== HYBRID Stage Advance ==========
         stage_advanced = False
         advance_reward = 0.0
+        advance_source = None  # "proactive" or "rl" for logging
+        self._proactive_advance_triggered = False
         
-        if stage_advance_signal > self.stage_advance_threshold:
+        # Priority 1: Check PROACTIVE advance (automatic based on IL behavior)
+        if self._check_proactive_advance():
+            stage_advanced, advance_reward = self._execute_proactive_advance()
+            if stage_advanced:
+                advance_source = "proactive"
+                self._total_proactive_advances += 1
+                if self.verbose:
+                    current_stage = self._il_wrapper.current_stage
+                    stage_name = current_stage.name if hasattr(current_stage, 'name') else str(current_stage)
+                    print(f"  📦 [PROACTIVE] Stage advanced from {stage_name}!")
+                    print(f"     Quality: {stage_quality:.3f}, Steps: {self._il_wrapper.stage_step_count}/{self.il_steps_per_stage}")
+        
+        # Priority 2: RL-initiated advance (if proactive didn't trigger)
+        if not stage_advanced and stage_advance_signal > self.stage_advance_threshold:
             stage_advanced, advance_reward = self._handle_stage_advance()
+            if stage_advanced:
+                advance_source = "rl"
+                self._total_rl_advances += 1
+                # Bonus for RL learning good timing!
+                advance_reward += 2.0  # Extra reward for RL-initiated advance
+                if self.verbose:
+                    print(f"  🤖 [RL] Stage advanced! Quality: {stage_quality:.2f}, Steps in stage: {self._il_wrapper.stage_step_count}")
         
-        # Update garment state
-        self._update_garment_pcd_and_gam()
+        # Reset quality history if stage advanced
+        if stage_advanced:
+            self._stage_quality_history = []
         
         # Get observation
         obs = self._get_observation()
@@ -638,25 +769,34 @@ class MultiStageResidualEnv(gym.Env):
         reward_info["advance_reward"] = advance_reward
         reward_info["residual_applied"] = apply_residual
         reward_info["effective_residual_norm"] = np.linalg.norm(effective_residual)
+        reward_info["advance_source"] = advance_source
+        reward_info["stage_quality"] = stage_quality
+        reward_info["should_advance_hint"] = self._get_should_advance_hint()
+        reward_info["manipulation_phase"] = self._current_phase
         
         # Track progress for early termination
         self._recent_fold_progress.append(reward_info.get("fold_progress", 0))
         if len(self._recent_fold_progress) > self._progress_window:
             self._recent_fold_progress.pop(0)
         
-        # Check for early termination (bad exploration)
-        early_term, term_reason = self._check_early_termination(obs)
+        # Check for early termination (bad exploration) - ONLY if enabled
+        early_term = False
+        term_reason = ""
+        if self.enable_early_termination:
+            early_term, term_reason = self._check_early_termination(obs)
         
         # Check termination
         all_stages_done = all(self._stages_completed)
         terminated = all_stages_done and self._check_final_success(obs)
         
-        # Early termination overrides normal termination
-        if early_term:
+        # Early termination overrides normal termination (only if enabled)
+        if early_term and self.enable_early_termination:
             terminated = True
-            reward -= self.reward_weights["early_termination_penalty"]
+            reward -= self.early_termination_penalty
             reward_info["early_termination"] = True
             reward_info["termination_reason"] = term_reason
+            if self.verbose:
+                print(f"  ⚠️ Early termination: {term_reason}")
         
         truncated = self.current_step >= self.max_episode_steps
         
@@ -671,7 +811,65 @@ class MultiStageResidualEnv(gym.Env):
             **reward_info,
         }
         
+        # ========== Verbose Logging ==========
+        if self.verbose:
+            # Periodic status print (ENHANCED with more info)
+            if self.current_step % self.print_every_n_steps == 0:
+                current_stage = self._il_wrapper.current_stage
+                stage_name = current_stage.name if hasattr(current_stage, 'name') else str(current_stage)
+                stages_done = sum(self._stages_completed)
+                hint = self._get_should_advance_hint()
+                phase_emoji = {"approach": "🎯", "manipulation": "🤲", "release": "🖐️"}.get(self._current_phase, "❓")
+                rl_status = "RL✓" if apply_residual else "IL"
+                stage_steps = self._il_wrapper.stage_step_count
+                progress_pct = (stage_steps / self.il_steps_per_stage) * 100
+                print(f"  [Step {self.current_step:3d}] Stage: {stage_name} ({stage_steps}/{self.il_steps_per_stage}, {progress_pct:.0f}%) | "
+                      f"Phase: {phase_emoji}{self._current_phase:12s} | {rl_status} | "
+                      f"Quality: {stage_quality:.3f} | Hint: {hint:.2f} | Stages: {stages_done}/3 | Reward: {reward:.2f}")
+            
+            # Episode end summary
+            if terminated or truncated:
+                self._print_episode_summary(info, terminated, truncated, early_term if early_term else False)
+        
         return obs, reward, terminated, truncated, info
+    
+    def _print_episode_summary(self, info: Dict, terminated: bool, truncated: bool, early_term: bool):
+        """Print episode summary at the end of each episode."""
+        is_success = info.get("is_success", False)
+        stages_completed = sum(self._stages_completed)
+        final_quality = info.get("stage_quality", 0)
+        total_reward = info.get("total_reward", 0)
+        
+        # Get current stage info
+        current_stage = self._il_wrapper.current_stage
+        stage_name = current_stage.name if hasattr(current_stage, 'name') else str(current_stage)
+        stage_steps = self._il_wrapper.stage_step_count
+        
+        # Determine outcome
+        if is_success:
+            outcome = "✅ SUCCESS"
+        elif early_term:
+            reason = info.get("termination_reason", "unknown")
+            outcome = f"❌ EARLY TERMINATION ({reason})"
+        elif truncated:
+            outcome = "⏱️ TRUNCATED (max steps)"
+        else:
+            outcome = "❌ FAILED"
+        
+        print(f"\n{'='*60}")
+        print(f"📊 Episode {self._episode_count} Summary")
+        print(f"{'='*60}")
+        print(f"  Outcome:        {outcome}")
+        print(f"  Steps:          {self.current_step}")
+        print(f"  Current Stage:  {stage_name} (step {stage_steps}/{self.il_steps_per_stage})")
+        print(f"  Stages Done:    {stages_completed}/3 {self._stages_completed}")
+        print(f"  Final Quality:  {final_quality:.3f}")
+        print(f"  Total Reward:   {total_reward:.3f}")
+        print(f"  RL Advances:    {self._total_rl_advances} (this episode)")
+        print(f"  Auto Advances:  {self._total_proactive_advances} (this episode)")
+        if stages_completed == 0:
+            print(f"  ⚠️  WARNING: No stages completed! Check IL execution.")
+        print(f"{'='*60}\n")
     
     def _execute_joint_action(self, joint_action: np.ndarray):
         """
@@ -703,9 +901,12 @@ class MultiStageResidualEnv(gym.Env):
         """
         Determine if residual should be applied this timestep.
         
-        Quick Wins logic:
-        1. Only apply every N steps (sparse intervention)
-        2. Skip during manipulation phase (gripper closed)
+        PHASE-AWARE CONTROL:
+        - APPROACH phase: RL CAN adjust arm positioning (where to grab)
+        - MANIPULATION phase: Pure IL (gripper closed, moving cloth)
+        - RELEASE phase: RL CAN adjust (gripper opening)
+        
+        This lets RL make HIGH-LEVEL decisions while IL handles detailed manipulation.
         
         Returns:
             True if residual should be applied
@@ -714,12 +915,53 @@ class MultiStageResidualEnv(gym.Env):
         if self.current_step % self.residual_apply_interval != 0:
             return False
         
-        # Check 2: Skip during active manipulation (gripper closed)
-        if self.disable_residual_during_manipulation:
+        # Check 2: Phase-aware gating
+        if self.enable_phase_aware_control:
+            phase = self._detect_manipulation_phase()
+            self._current_phase = phase  # Store for logging
+            
+            # Only allow residuals in approach and release phases
+            if phase == "manipulation":
+                return False  # Pure IL during manipulation
+            # "approach" and "release" phases allow residuals
+        
+        # Fallback: Original gripper-based check
+        elif self.disable_residual_during_manipulation:
             if self._is_gripper_closed():
                 return False
         
         return True
+    
+    def _detect_manipulation_phase(self) -> str:
+        """
+        Detect current manipulation phase within the stage.
+        
+        Phases:
+        - "approach": Moving toward grasp point (gripper open, early in stage)
+        - "manipulation": Grasping and moving cloth (gripper closed)
+        - "release": Releasing cloth (gripper opening, late in stage)
+        
+        Returns:
+            Phase name: "approach", "manipulation", or "release"
+        """
+        stage_steps = self._il_wrapper.stage_step_count
+        gripper_closed = self._is_gripper_closed()
+        
+        # Early in stage + gripper open = approach phase
+        if stage_steps < self.approach_phase_steps and not gripper_closed:
+            return "approach"
+        
+        # Gripper closed = manipulation phase (IL controls)
+        if gripper_closed:
+            return "manipulation"
+        
+        # Late in stage + gripper open = release phase
+        # (After manipulation, hand opened for release)
+        if stage_steps > self.approach_phase_steps and not gripper_closed:
+            return "release"
+        
+        # Default to manipulation (safest)
+        return "manipulation"
     
     def _is_gripper_closed(self) -> bool:
         """
@@ -782,7 +1024,9 @@ class MultiStageResidualEnv(gym.Env):
     
     def _handle_stage_advance(self) -> Tuple[bool, float]:
         """
-        Handle stage advance attempt.
+        Handle RL-initiated stage advance attempt.
+        
+        IMPORTANT: Opens hands before advancing to prevent dragging cloth!
         
         Returns:
             (success, reward) tuple
@@ -799,11 +1043,16 @@ class MultiStageResidualEnv(gym.Env):
             return False, -self.reward_weights["premature_advance_penalty"]
         
         # Check if current stage fold is good enough
+        # RELAXED: Lower threshold to allow more advances (was 0.3, now 0.15)
         stage_quality = self._evaluate_current_stage_quality()
         
-        if stage_quality < 0.3:
-            # Too early to advance
+        if stage_quality < 0.15:
+            # Too early to advance (but more lenient)
             return False, -self.reward_weights["premature_advance_penalty"]
+        
+        # ========== SAFE TRANSITION: Open hands first! ==========
+        # This prevents dragging the cloth to the new manipulation point
+        self._safe_release_before_transition()
         
         # Mark current stage as completed
         stage_idx = int(current_stage) - 1
@@ -813,6 +1062,9 @@ class MultiStageResidualEnv(gym.Env):
         success = self._il_wrapper.advance_stage()
         
         if success:
+            # Reset stage quality history for new stage
+            self._stage_quality_history = []
+            
             # Store new stage initial bbox
             self._stage_initial_bbox = self._compute_bbox(self._current_garment_pcd)
             
@@ -830,6 +1082,58 @@ class MultiStageResidualEnv(gym.Env):
             return True, advance_reward
         
         return False, 0.0
+    
+    def _safe_release_before_transition(self):
+        """
+        Safely release any grasped cloth before transitioning to next stage.
+        
+        This is CRITICAL to prevent dragging cloth when moving to new manipulation point.
+        
+        Steps:
+        1. Open both hands
+        2. Let cloth settle with increased gravity
+        3. Move arms away from cloth
+        """
+        if self.verbose:
+            print("  🖐️ Safe release: Opening hands before stage transition...")
+        
+        # 1. Open both hands
+        self._robot.set_both_hand_state("open", "open")
+        for _ in range(30):
+            self._base_env.step()
+        
+        # 2. Let cloth settle with increased gravity
+        self._garment.particle_material.set_gravity_scale(10.0)
+        for _ in range(50):
+            self._base_env.step()
+        self._garment.particle_material.set_gravity_scale(1.0)
+        
+        # 3. Move arms up and away from cloth to avoid collision during repositioning
+        try:
+            # Move left arm up
+            left_pos, _ = self._robot.dexleft.get_cur_ee_pos()
+            left_target = np.array([left_pos[0], left_pos[1], 0.4])  # Lift up
+            self._robot.dexleft.dense_step_action(
+                target_pos=left_target,
+                target_ori=np.array([0.579, -0.579, -0.406, 0.406]),
+                angular_type="quat"
+            )
+            
+            # Move right arm up
+            right_pos, _ = self._robot.dexright.get_cur_ee_pos()
+            right_target = np.array([right_pos[0], right_pos[1], 0.4])  # Lift up
+            self._robot.dexright.dense_step_action(
+                target_pos=right_target,
+                target_ori=np.array([0.406, -0.406, -0.579, 0.579]),
+                angular_type="quat"
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"  ⚠️ Warning: Could not lift arms: {e}")
+        
+        # Final settle
+        for _ in range(20):
+            self._base_env.step()
     
     def _evaluate_current_stage_quality(self) -> float:
         """
@@ -858,6 +1162,148 @@ class MultiStageResidualEnv(gym.Env):
         # Clamp to [0, 1]
         return np.clip(area_reduction, 0.0, 1.0)
     
+    # ==================== HYBRID Stage Advance Methods ====================
+    
+    def _check_proactive_advance(self) -> bool:
+        """
+        Check if proactive (automatic) stage advance should happen.
+        
+        Proactive advance triggers when:
+        1. IL has run most of its natural duration (~90% of steps)
+        2. Quality is above minimum threshold
+        3. OR quality has plateaued (no improvement for N steps)
+        
+        Returns:
+            True if proactive advance should happen
+        """
+        if not self.enable_proactive_advance:
+            return False
+        
+        current_stage = self._il_wrapper.current_stage
+        if current_stage == FoldingStage.COMPLETED:
+            return False
+        
+        stage_steps = self._il_wrapper.stage_step_count
+        stage_quality = self._evaluate_current_stage_quality()
+        
+        # Condition 1: IL has run most of its natural duration
+        steps_threshold = int(self.il_steps_per_stage * self.proactive_advance_after_ratio)
+        duration_met = stage_steps >= steps_threshold
+        quality_ok = stage_quality >= self.min_quality_for_proactive
+        
+        # More lenient: If duration met, advance even with low quality (IL might be done)
+        if duration_met:
+            # If quality is decent, definitely advance
+            if quality_ok:
+                return True
+            # Even with low quality, advance if we've run long enough (IL might be stuck)
+            if stage_steps >= self.il_steps_per_stage:  # Full duration
+                return True
+        
+        # Condition 2: Quality has plateaued (even if duration not fully met)
+        if self._detect_quality_plateau() and stage_quality >= self.min_quality_for_proactive:
+            return True
+        
+        return False
+    
+    def _detect_quality_plateau(self) -> bool:
+        """
+        Detect if stage quality has plateaued (no improvement).
+        
+        This indicates IL has done what it can and it's time to move on.
+        
+        Returns:
+            True if quality has plateaued
+        """
+        if len(self._stage_quality_history) < self.quality_plateau_window:
+            return False
+        
+        recent = self._stage_quality_history[-self.quality_plateau_window:]
+        improvement = recent[-1] - recent[0]
+        
+        # If quality hasn't improved much, it's plateaued
+        return improvement < self.quality_plateau_threshold
+    
+    def _get_should_advance_hint(self) -> float:
+        """
+        Get hint value for observation (helps RL learn faster).
+        
+        Returns value in [0, 1]:
+        - 0.0: Not ready to advance
+        - 0.5: Getting close (>50% of IL steps)
+        - 1.0: Proactive conditions fully met
+        """
+        current_stage = self._il_wrapper.current_stage
+        if current_stage == FoldingStage.COMPLETED:
+            return 0.0
+        
+        stage_steps = self._il_wrapper.stage_step_count
+        stage_quality = self._evaluate_current_stage_quality()
+        
+        # Base hint from step progress
+        step_ratio = stage_steps / self.il_steps_per_stage
+        step_hint = np.clip(step_ratio, 0.0, 1.0)
+        
+        # Quality contribution
+        quality_hint = np.clip(stage_quality / 0.3, 0.0, 1.0)  # 0.3 = good quality
+        
+        # Combined hint (both duration and quality matter)
+        combined = (step_hint + quality_hint) / 2.0
+        
+        # Boost to 1.0 if proactive conditions fully met
+        if self._check_proactive_advance():
+            combined = 1.0
+        
+        return combined
+    
+    def _execute_proactive_advance(self) -> Tuple[bool, float]:
+        """
+        Execute a proactive (automatic) stage advance.
+        
+        Similar to _handle_stage_advance but with different reward structure
+        since this is automatic, not RL-initiated.
+        
+        IMPORTANT: Opens hands before advancing to prevent dragging cloth!
+        
+        Returns:
+            (success, reward) tuple
+        """
+        current_stage = self._il_wrapper.current_stage
+        stage_quality = self._evaluate_current_stage_quality()
+        
+        # ========== SAFE TRANSITION: Open hands first! ==========
+        # This prevents dragging the cloth to the new manipulation point
+        self._safe_release_before_transition()
+        
+        # Mark current stage as completed
+        stage_idx = int(current_stage) - 1
+        if 0 <= stage_idx < 3:
+            self._stages_completed[stage_idx] = True
+        
+        # Advance to next stage
+        success = self._il_wrapper.advance_stage()
+        
+        if success:
+            # Reset stage quality history for new stage
+            self._stage_quality_history = []
+            
+            # Store new stage initial bbox
+            self._stage_initial_bbox = self._compute_bbox(self._current_garment_pcd)
+            
+            # Update garment state and GAM for new stage
+            self._update_garment_pcd_and_gam()
+            
+            # Pre-position robot for new stage
+            self._pre_position_robot_for_stage()
+            
+            # Reward for completing stage (smaller than RL-initiated to encourage RL learning)
+            advance_reward = self.reward_weights["stage_completion_bonus"]
+            
+            self._proactive_advance_triggered = True
+            return True, advance_reward
+        
+        return False, 0.0
+    
     def _update_garment_pcd_and_gam(self):
         """Update cached garment point cloud and GAM keypoints."""
         # Hide robots
@@ -885,6 +1331,14 @@ class MultiStageResidualEnv(gym.Env):
         # Normalize point cloud
         self._current_garment_pcd = self._normalize_pcd(pcd)
         
+        # ========== NaN Protection for Point Cloud ==========
+        if np.isnan(self._current_garment_pcd).any() or np.isinf(self._current_garment_pcd).any():
+            if self.verbose:
+                print("  ⚠️ WARNING: Invalid values in point cloud, replacing with zeros")
+            self._current_garment_pcd = np.nan_to_num(
+                self._current_garment_pcd, nan=0.0, posinf=0.0, neginf=0.0
+            ).astype(np.float32)
+        
         # Get GAM keypoints and similarity
         try:
             keypoints, indices, similarity = self._gam_model.get_manipulation_points(
@@ -893,7 +1347,15 @@ class MultiStageResidualEnv(gym.Env):
             )
             self._gam_keypoints = keypoints.astype(np.float32)
             self._gam_similarity = similarity
-        except:
+            
+            # NaN protection for keypoints
+            if np.isnan(self._gam_keypoints).any():
+                if self.verbose:
+                    print("  ⚠️ WARNING: NaN in GAM keypoints, replacing with zeros")
+                self._gam_keypoints = np.nan_to_num(self._gam_keypoints, nan=0.0).astype(np.float32)
+        except Exception as e:
+            if self.verbose:
+                print(f"  ⚠️ WARNING: GAM failed: {e}")
             self._gam_keypoints = np.zeros((6, 3), dtype=np.float32)
             self._gam_similarity = None
         
@@ -1019,7 +1481,17 @@ class MultiStageResidualEnv(gym.Env):
             il_action = self._get_il_joint_action(il_obs).astype(np.float32)
             self._last_il_action = il_action
         
-        return {
+        # Get current manipulation phase one-hot encoding
+        phase = self._detect_manipulation_phase() if self.enable_phase_aware_control else "manipulation"
+        phase_one_hot = np.zeros(3, dtype=np.float32)
+        if phase == "approach":
+            phase_one_hot[0] = 1.0
+        elif phase == "manipulation":
+            phase_one_hot[1] = 1.0
+        elif phase == "release":
+            phase_one_hot[2] = 1.0
+        
+        obs = {
             "garment_pcd": self._current_garment_pcd.astype(np.float32),
             "joint_positions": joint_positions,
             "ee_poses": ee_poses,
@@ -1028,7 +1500,23 @@ class MultiStageResidualEnv(gym.Env):
             "current_stage": self._il_wrapper.get_stage_one_hot(),
             "stage_progress": np.array([self._il_wrapper.get_stage_progress()], dtype=np.float32),
             "stages_completed": np.array(self._stages_completed, dtype=np.float32),
+            # Hint for RL about when to advance
+            "should_advance_hint": np.array([self._get_should_advance_hint()], dtype=np.float32),
+            # Current manipulation phase [approach, manipulation, release]
+            "manipulation_phase": phase_one_hot,
         }
+        
+        # ========== NaN Protection ==========
+        # Replace any NaN/Inf values to prevent policy network crash
+        for key, value in obs.items():
+            if np.isnan(value).any() or np.isinf(value).any():
+                if self.verbose:
+                    nan_count = np.isnan(value).sum()
+                    inf_count = np.isinf(value).sum()
+                    print(f"  ⚠️ WARNING: NaN/Inf in '{key}' (NaN: {nan_count}, Inf: {inf_count})")
+                obs[key] = np.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        
+        return obs
     
     def _get_il_observation(self) -> Dict[str, np.ndarray]:
         """Get observation in format expected by SADP_G."""
@@ -1066,12 +1554,22 @@ class MultiStageResidualEnv(gym.Env):
         
         # Ensure correct shape
         if len(joint_action) != self.joint_dim:
-            print(f"[WARNING] IL action has shape {joint_action.shape}, expected ({self.joint_dim},)")
+            if self.verbose:
+                print(f"  ⚠️ WARNING: IL action has shape {joint_action.shape}, expected ({self.joint_dim},)")
             # Pad or truncate if needed
             if len(joint_action) < self.joint_dim:
                 joint_action = np.pad(joint_action, (0, self.joint_dim - len(joint_action)))
             else:
                 joint_action = joint_action[:self.joint_dim]
+        
+        # ========== NaN Protection for IL Action ==========
+        if np.isnan(joint_action).any() or np.isinf(joint_action).any():
+            if self.verbose:
+                print("  ⚠️ WARNING: NaN/Inf in IL action, using current joint positions")
+            # Fallback to current joint positions (stay in place)
+            left_joints = self._robot.dexleft.get_joint_positions()
+            right_joints = self._robot.dexright.get_joint_positions()
+            joint_action = np.concatenate([left_joints, right_joints])
         
         return joint_action.astype(np.float32)
     
@@ -1169,14 +1667,20 @@ class MultiStageResidualEnv(gym.Env):
         """
         Check if garment is in an anomalous state (stretched, lifted, out of bounds).
         
+        RELAXED THRESHOLDS: Only trigger on extreme cases to allow IL to work.
+        
         Returns:
             (is_anomaly, anomaly_type) tuple
         """
         pcd = obs["garment_pcd"]
         
+        if len(pcd) == 0:
+            return False, ""  # Empty point cloud is handled elsewhere
+        
         # 1. Height anomaly: garment lifted too high (swinging)
+        # RELAXED: Only trigger if extremely high (was 0.5m, now 1.0m)
         max_height = np.max(pcd[:, 2])
-        if max_height > 0.5:  # More than 0.5m above ground
+        if max_height > 1.0:  # More than 1.0m above ground (very extreme)
             return True, "garment_lifted"
         
         # 2. Spread anomaly: garment stretched too much
@@ -1184,23 +1688,25 @@ class MultiStageResidualEnv(gym.Env):
         current_size = current_bbox[3:6] - current_bbox[0:3]
         initial_size = self._initial_bbox[3:6] - self._initial_bbox[0:3]
         
-        # If XY spread increased significantly (garment being stretched)
-        stretch_threshold = 1.3  # 30% larger than initial
+        # RELAXED: Only trigger if extremely stretched (was 1.3x, now 2.0x)
+        stretch_threshold = 2.0  # 100% larger than initial (very extreme)
         if current_size[0] > initial_size[0] * stretch_threshold:
             return True, "garment_stretched_x"
         if current_size[1] > initial_size[1] * stretch_threshold:
             return True, "garment_stretched_y"
         
         # 3. Position anomaly: garment center moved out of workspace
+        # RELAXED: Only trigger if way out of bounds (was 1.0m, now 2.0m)
         center = np.mean(pcd, axis=0)
-        if abs(center[0]) > 1.0:  # Too far left/right
+        if abs(center[0]) > 2.0:  # Way too far left/right
             return True, "garment_out_of_bounds_x"
-        if center[1] < 0.2 or center[1] > 1.5:  # Too far forward/back
+        if center[1] < -0.5 or center[1] > 2.5:  # Way too far forward/back
             return True, "garment_out_of_bounds_y"
         
         # 4. Dispersion anomaly: garment points too spread out (being torn apart)
+        # RELAXED: Only trigger on extreme dispersion (was 0.5, now 1.0)
         point_std = np.std(pcd, axis=0)
-        if np.max(point_std) > 0.5:  # Very high variance
+        if np.max(point_std) > 1.0:  # Very extreme variance
             return True, "garment_dispersed"
         
         return False, ""
@@ -1209,33 +1715,41 @@ class MultiStageResidualEnv(gym.Env):
         """
         Check conditions for early episode termination (bad exploration).
         
+        VERY LENIENT: Only terminate on extreme cases to allow IL to work.
+        Most checks are disabled or have very relaxed thresholds.
+        
         Returns:
             (should_terminate, reason) tuple
         """
         # 1. Garment anomaly check (stretched, lifted, out of bounds)
+        # Only check extreme anomalies
         is_anomaly, anomaly_type = self._check_garment_anomaly(obs)
         if is_anomaly:
             return True, f"anomaly_{anomaly_type}"
         
         # 2. No progress for too long in current stage
+        # RELAXED: Only check if way beyond normal (was 4x, now 10x)
         stage_steps = self._il_wrapper.stage_step_count
         stage_config = self._il_wrapper.current_stage_config
         if stage_config:
-            max_allowed = stage_config.max_inference_steps * 4  # 4x normal is too long
+            max_allowed = stage_config.max_inference_steps * 10  # 10x normal (very lenient)
             if stage_steps > max_allowed:
                 quality = self._evaluate_current_stage_quality()
-                if quality < 0.1:  # Almost no progress
+                # Only terminate if absolutely no progress (was 0.1, now 0.0)
+                if quality < 0.0:  # Negative quality (impossible, but safe check)
                     return True, "no_stage_progress"
         
         # 3. Regression: fold quality getting worse over time
-        if len(self._recent_fold_progress) >= self._progress_window:
-            recent_trend = self._recent_fold_progress[-1] - self._recent_fold_progress[0]
-            if recent_trend < -0.15:  # Significant regression
-                return True, "regressing"
+        # DISABLED: Too aggressive, IL might have temporary regressions
+        # if len(self._recent_fold_progress) >= self._progress_window:
+        #     recent_trend = self._recent_fold_progress[-1] - self._recent_fold_progress[0]
+        #     if recent_trend < -0.15:  # Significant regression
+        #         return True, "regressing"
         
         # 4. Very negative fold progress (made things worse than initial)
+        # RELAXED: Only trigger on extreme negative progress (was -0.2, now -0.5)
         current_progress = self._recent_fold_progress[-1] if self._recent_fold_progress else 0
-        if current_progress < -0.2:  # Garment spread out significantly
+        if current_progress < -0.5:  # Garment spread out extremely (very rare)
             return True, "negative_progress"
         
         return False, ""

@@ -38,26 +38,34 @@ class HierarchicalILFoldEnv(gym.Env):
     The agent selects HIGH-LEVEL stages (stage_1, stage_2, stage_3)
     and the environment executes them using trained SADP_G models.
     
-    Action Space (Discrete):
+    Action Space (Discrete - 7 actions):
         0: STAGE_1_LEFT_SLEEVE  - Execute SADP_G stage 1 model
         1: STAGE_2_RIGHT_SLEEVE - Execute SADP_G stage 2 model
         2: STAGE_3_BOTTOM_FOLD  - Execute SADP_G stage 3 model
         3: OPEN_HANDS           - Open both grippers
         4: MOVE_TO_HOME         - Move arms to home position
-        5: DONE                 - Signal task completion
+        5: WAIT                 - Wait (do nothing) - allows RL to learn timing
+        6: DONE                 - Signal task completion
         
-    Observation Space (Dict):
+    Observation Space (Dict - ENHANCED):
         - garment_pcd: Point cloud of garment (N, 3)
         - gam_keypoints: GAM-detected manipulation points (6, 3)
-        - primitive_mask: Which primitives are still available (6,)
-        - executed_sequence: One-hot of executed primitives (6,)
+        - primitive_mask: Which primitives are still available (7,)
+        - executed_sequence: One-hot of executed primitives (7,)
+        - overall_fold_quality: Current fold quality [0, 1] (NEW!)
+        - stages_completed: Which stages are done [3,] (NEW!)
+        - stage_progress: Overall progress [0, 1] (NEW!)
         
-    Reward:
-        - +5.0 for each successful IL stage
-        - +15.0 bonus for completing all three stages
-        - -1.0 for failed stage
+    Reward (ENHANCED - Quality-Based):
+        - +10.0 base for each successful IL stage
+        - +5.0 × fold_quality bonus (quality-based reward)
+        - +1.0, +2.0, +3.0 progressive bonus for stages 1, 2, 3
+        - +10.0 bonus for completing all three stages
+        - +20.0 base + 10.0 × final_quality for task completion
+        - -2.0 for failed stage
         - -0.5 for selecting already-executed stage
-        - -2.0 for selecting DONE before task is complete
+        - -5.0 for selecting DONE before task is complete
+        - -0.1 for WAIT (small penalty to encourage action)
     """
     
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
@@ -75,6 +83,8 @@ class HierarchicalILFoldEnv(gym.Env):
         render_mode: str = "human",
         max_primitives: int = 10,
         point_cloud_size: int = 2048,
+        # Logging configuration
+        verbose: bool = True,          # Print training progress
         # Device
         device: str = "cuda:0",
     ):
@@ -105,6 +115,7 @@ class HierarchicalILFoldEnv(gym.Env):
         self.render_mode = render_mode
         self.max_primitives = max_primitives
         self.point_cloud_size = point_cloud_size
+        self.verbose = verbose
         
         # Will be initialized lazily
         self._initialized = False
@@ -115,11 +126,13 @@ class HierarchicalILFoldEnv(gym.Env):
         self.current_step = 0
         self.total_physics_steps = 0
         self.executed_sequence = []
+        self._episode_count = 0
+        self._stage_qualities = []  # Track quality after each stage
         
-        # Define action space: 6 discrete primitive choices
+        # Define action space: 7 discrete primitive choices (added WAIT)
         self.action_space = spaces.Discrete(len(ILPrimitiveID))
         
-        # Define observation space
+        # Define observation space (ENHANCED with quality and progress metrics)
         self.observation_space = spaces.Dict({
             "garment_pcd": spaces.Box(
                 low=-10.0, high=10.0,
@@ -139,6 +152,22 @@ class HierarchicalILFoldEnv(gym.Env):
             "executed_sequence": spaces.Box(
                 low=0, high=1,
                 shape=(len(ILPrimitiveID),),
+                dtype=np.float32
+            ),
+            # NEW: Quality and progress metrics to help RL learn
+            "overall_fold_quality": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1,),
+                dtype=np.float32
+            ),
+            "stages_completed": spaces.Box(
+                low=0, high=1,
+                shape=(3,),  # [stage1_done, stage2_done, stage3_done]
+                dtype=np.float32
+            ),
+            "stage_progress": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1,),  # Overall progress toward completion
                 dtype=np.float32
             ),
         })
@@ -289,7 +318,13 @@ class HierarchicalILFoldEnv(gym.Env):
         self.current_step = 0
         self.total_physics_steps = 0
         self.executed_sequence = []
+        self._stage_qualities = []
+        self._episode_count += 1
         self._primitives.reset()
+        
+        if self.verbose:
+            print(f"\n🎬 Starting Episode {self._episode_count}")
+            print(f"   IL Policy: {'Dummy' if self.use_dummy_il else 'SADP_G'}")
         
         # ========== CRITICAL: Full World Reset ==========
         # Particle cloth maintains internal state that carries over between episodes.
@@ -368,18 +403,36 @@ class HierarchicalILFoldEnv(gym.Env):
             "primitive_id": int(primitive_id),
         }
         
+        # Handle WAIT action (NEW!)
+        if primitive_id == ILPrimitiveID.WAIT:
+            # Small negative reward for waiting (encourages action, but allows timing)
+            reward = -0.1
+            info["message"] = "Waiting..."
+            obs = self._get_observation()
+            return obs, reward, False, False, info
+        
         # Handle DONE action
         if primitive_id == ILPrimitiveID.DONE:
             if self._primitives.is_complete_sequence():
                 # Task completed successfully!
-                reward = 15.0  # Big bonus for completing the task
-                info["success"] = True
-                info["message"] = "Task completed successfully with IL policies!"
                 obs = self._get_observation()
+                final_quality = self._compute_fold_quality(obs["garment_pcd"])
+                
+                # Enhanced reward: base + quality bonus
+                reward = 20.0  # Base completion bonus (increased from 15.0)
+                reward += final_quality * 10.0  # Quality bonus (up to +10)
+                
+                info["success"] = True
+                info["final_quality"] = final_quality
+                info["message"] = f"Task completed! Final quality: {final_quality:.3f}"
+                
+                if self.verbose:
+                    self._print_episode_summary(info, True)
+                
                 return obs, reward, True, False, info
             else:
                 # Premature DONE - penalty
-                reward = -2.0
+                reward = -5.0  # Increased penalty
                 info["success"] = False
                 info["message"] = "DONE selected but task not complete"
                 obs = self._get_observation()
@@ -402,27 +455,43 @@ class HierarchicalILFoldEnv(gym.Env):
         info.update(result.info)
         info["physics_steps"] = result.steps_taken
         
-        # Compute reward based on primitive result
+        # Compute reward based on primitive result (ENHANCED REWARD SHAPING)
         if result.success:
             if is_folding_primitive:
-                reward = 5.0  # Reward for successful IL stage
-                
-                # Bonus for good fold quality
                 obs = self._get_observation()
                 fold_quality = self._compute_fold_quality(obs["garment_pcd"])
-                reward += fold_quality * 3.0  # Up to +3 bonus
+                self._stage_qualities.append(fold_quality)
+                
+                # Enhanced quality-based reward
+                base_reward = 10.0  # Base reward for successful stage (increased from 5.0)
+                quality_bonus = fold_quality * 5.0  # Quality bonus (increased from 3.0)
+                reward = base_reward + quality_bonus
+                
+                # Progressive bonus: later stages worth more (encourages completion)
+                stage_num = int(primitive_id) + 1
+                stage_bonus = stage_num * 1.0  # +1, +2, +3 for stages 1, 2, 3
+                reward += stage_bonus
                 
                 info["fold_quality"] = fold_quality
+                info["stage_bonus"] = stage_bonus
+                
+                if self.verbose:
+                    print(f"  ✅ Stage {stage_num} completed! Quality: {fold_quality:.3f}, Reward: {reward:.2f}")
             else:
-                reward = 0.1  # Small reward for utility primitives
+                reward = 0.2  # Small reward for utility primitives (increased from 0.1)
         else:
-            reward = -1.0  # Penalty for failed primitive
+            reward = -2.0  # Penalty for failed primitive (increased from -1.0)
             info["error"] = result.info.get("error", "Unknown error")
+            if self.verbose:
+                print(f"  ❌ Stage failed: {info.get('error', 'Unknown error')}")
         
         # Check if all stages done (but agent hasn't said DONE yet)
         if self._primitives.is_complete_sequence():
-            reward += 8.0  # Bonus for completing all IL stages
+            reward += 10.0  # Bonus for completing all IL stages (increased from 8.0)
             info["all_stages_complete"] = True
+            if self.verbose:
+                avg_quality = np.mean(self._stage_qualities) if self._stage_qualities else 0.0
+                print(f"  🎉 All stages complete! Average quality: {avg_quality:.3f}")
         
         # Track sequence
         self.executed_sequence.append(primitive_id)
@@ -436,8 +505,34 @@ class HierarchicalILFoldEnv(gym.Env):
         
         if truncated:
             info["message"] = "Episode truncated (max primitives reached)"
+            if self.verbose:
+                self._print_episode_summary(info, False, True)
         
         return obs, reward, terminated, truncated, info
+    
+    def _print_episode_summary(self, info: Dict, success: bool, truncated: bool = False):
+        """Print episode summary at the end."""
+        stages_done = sum([
+            ILPrimitiveID.STAGE_1_LEFT_SLEEVE in self._primitives.get_executed_primitives(),
+            ILPrimitiveID.STAGE_2_RIGHT_SLEEVE in self._primitives.get_executed_primitives(),
+            ILPrimitiveID.STAGE_3_BOTTOM_FOLD in self._primitives.get_executed_primitives(),
+        ])
+        
+        avg_quality = np.mean(self._stage_qualities) if self._stage_qualities else 0.0
+        final_quality = info.get("final_quality", self._compute_fold_quality(self._get_garment_pcd()))
+        
+        outcome = "✅ SUCCESS" if success else ("⏱️ TRUNCATED" if truncated else "❌ FAILED")
+        
+        print(f"\n{'='*60}")
+        print(f"📊 Episode {self._episode_count} Summary")
+        print(f"{'='*60}")
+        print(f"  Outcome:        {outcome}")
+        print(f"  Steps:          {self.current_step}")
+        print(f"  Stages Done:    {stages_done}/3")
+        print(f"  Avg Quality:    {avg_quality:.3f}")
+        print(f"  Final Quality:  {final_quality:.3f}")
+        print(f"  Sequence:       {' → '.join([p.name for p in self.executed_sequence])}")
+        print(f"{'='*60}\n")
     
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """Get current observation."""
@@ -469,12 +564,38 @@ class HierarchicalILFoldEnv(gym.Env):
         for pid in executed:
             executed_sequence[pid] = 1.0
         
-        return {
+        # Compute quality and progress metrics (NEW!)
+        overall_quality = self._compute_fold_quality(garment_pcd)
+        
+        # Stages completed (one-hot for each of the 3 folding stages)
+        stages_completed = np.zeros(3, dtype=np.float32)
+        if ILPrimitiveID.STAGE_1_LEFT_SLEEVE in executed:
+            stages_completed[0] = 1.0
+        if ILPrimitiveID.STAGE_2_RIGHT_SLEEVE in executed:
+            stages_completed[1] = 1.0
+        if ILPrimitiveID.STAGE_3_BOTTOM_FOLD in executed:
+            stages_completed[2] = 1.0
+        
+        # Overall progress (0.0 to 1.0)
+        stage_progress = np.sum(stages_completed) / 3.0
+        
+        obs = {
             "garment_pcd": garment_pcd.astype(np.float32),
             "gam_keypoints": gam_keypoints,
             "primitive_mask": primitive_mask,
             "executed_sequence": executed_sequence,
+            # NEW: Quality and progress metrics
+            "overall_fold_quality": np.array([overall_quality], dtype=np.float32),
+            "stages_completed": stages_completed,
+            "stage_progress": np.array([stage_progress], dtype=np.float32),
         }
+        
+        # NaN protection
+        for key, value in obs.items():
+            if np.isnan(value).any() or np.isinf(value).any():
+                obs[key] = np.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        
+        return obs
     
     def _get_garment_pcd(self) -> np.ndarray:
         """Get garment point cloud, hiding robot temporarily."""

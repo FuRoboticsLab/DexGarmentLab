@@ -31,7 +31,8 @@ class ILPrimitiveID(IntEnum):
     STAGE_3_BOTTOM_FOLD = 2   # Execute SADP_G stage 3
     OPEN_HANDS = 3            # Utility: Open grippers
     MOVE_TO_HOME = 4          # Utility: Move to home position
-    DONE = 5                  # Signal completion
+    WAIT = 5                  # Wait (do nothing) - allows RL to learn timing
+    DONE = 6                  # Signal completion
 
 
 @dataclass
@@ -157,6 +158,8 @@ class ILManipulationPrimitives:
             return self._open_hands()
         elif primitive_id == ILPrimitiveID.MOVE_TO_HOME:
             return self._move_to_home()
+        elif primitive_id == ILPrimitiveID.WAIT:
+            return self._wait()
         elif primitive_id == ILPrimitiveID.DONE:
             return ILPrimitiveResult(success=True, steps_taken=0, info={"action": "done"})
         else:
@@ -488,6 +491,23 @@ class ILManipulationPrimitives:
                 steps_taken=steps,
                 info={"error": str(e), "primitive": "move_to_home"}
             )
+    
+    def _wait(self) -> ILPrimitiveResult:
+        """
+        Wait action - do nothing for a short time.
+        
+        Allows RL to learn optimal timing by waiting before advancing stages.
+        Useful when IL needs more time to complete a fold or when waiting
+        for garment to settle.
+        """
+        # Just step physics a few times (let garment settle)
+        for _ in range(20):
+            self.base_env.step()
+        return ILPrimitiveResult(
+            success=True,
+            steps_taken=20,
+            info={"primitive": "wait"}
+        )
     
     def get_executed_primitives(self) -> set:
         """Get set of primitives that have been executed."""

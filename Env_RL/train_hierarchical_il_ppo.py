@@ -125,8 +125,11 @@ class HierarchicalILPolicyNetwork:
     Handles Dict observations with:
     - Point cloud (2048, 3) - simplified encoder
     - GAM keypoints (6, 3) - semantic manipulation points
-    - Primitive mask (6,) - which primitives are available
-    - Executed sequence (6,) - which primitives have been done
+    - Primitive mask (7,) - which primitives are available (added WAIT)
+    - Executed sequence (7,) - which primitives have been done (added WAIT)
+    - Overall fold quality (1,) - current fold quality [NEW]
+    - Stages completed (3,) - which stages are done [NEW]
+    - Stage progress (1,) - overall progress [NEW]
     """
     
     @staticmethod
@@ -159,32 +162,46 @@ class HierarchicalILPolicyNetwork:
                     nn.ReLU(),
                 )
                 
-                # Primitive state encoder
+                # Primitive state encoder (UPDATED: 7+7=14 for mask+sequence)
                 self.state_encoder = nn.Sequential(
-                    nn.Linear(12, 16),  # mask (6) + executed (6)
+                    nn.Linear(14, 20),  # mask (7) + executed (7)
                     nn.ReLU(),
                 )
                 
-                # Combiner: 64 (pcd) + 32 (gam) + 16 (state) = 112
+                # Quality/progress encoder (NEW!)
+                self.quality_encoder = nn.Sequential(
+                    nn.Linear(5, 8),  # quality (1) + stages_completed (3) + progress (1)
+                    nn.ReLU(),
+                )
+                
+                # Combiner: 64 (pcd) + 32 (gam) + 20 (state) + 8 (quality) = 124
                 self.combiner = nn.Sequential(
-                    nn.Linear(112, features_dim),
+                    nn.Linear(124, features_dim),
                     nn.ReLU(),
                 )
-                
+            
             def forward(self, observations):
                 pcd_features = self.pcd_encoder(observations["garment_pcd"])
                 gam_features = self.gam_encoder(observations["gam_keypoints"])
                 
-                # Concatenate mask and executed sequence
+                # Concatenate mask and executed sequence (now 7+7=14)
                 state = torch.cat([
                     observations["primitive_mask"],
                     observations["executed_sequence"]
                 ], dim=1)
                 state_features = self.state_encoder(state)
                 
+                # NEW: Quality and progress features
+                quality_features = torch.cat([
+                    observations["overall_fold_quality"],
+                    observations["stages_completed"],
+                    observations["stage_progress"]
+                ], dim=1)
+                quality_encoded = self.quality_encoder(quality_features)
+                
                 # Combine all features
                 combined = torch.cat([
-                    pcd_features, gam_features, state_features
+                    pcd_features, gam_features, state_features, quality_encoded
                 ], dim=1)
                 
                 return self.combiner(combined)
@@ -207,13 +224,14 @@ def main():
         print(f"  Stage 3 Checkpoint: {args.stage_3_checkpoint}")
         print(f"  Training Data: {args.training_data_num}")
     print("-" * 70)
-    print("Action space: 6 discrete primitives (IL-based)")
+    print("Action space: 7 discrete primitives (IL-based)")
     print(f"  0: STAGE_1_LEFT_SLEEVE  (SADP_G Stage 1)")
     print(f"  1: STAGE_2_RIGHT_SLEEVE (SADP_G Stage 2)")
     print(f"  2: STAGE_3_BOTTOM_FOLD  (SADP_G Stage 3)")
     print(f"  3: OPEN_HANDS")
     print(f"  4: MOVE_TO_HOME")
-    print(f"  5: DONE")
+    print(f"  5: WAIT                 (NEW: Learn optimal timing)")
+    print(f"  6: DONE")
     print("-" * 70)
     print(f"Headless: {args.headless}")
     print(f"Total timesteps: {args.total_timesteps}")
